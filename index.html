@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>Sale Hub</title>
+<link rel="icon" href="https://i.postimg.cc/RVy6cmjv/RSM-group-logo-outline-1.png">
+<style>
+  html, body { margin: 0; height: 100%; background: #f1f5f9; overflow: hidden; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #app { position: fixed; inset: 0; width: 100%; height: 100%; border: 0; }
+  #cam { position: fixed; inset: 0; z-index: 10; background: #000; display: none; flex-direction: column; }
+  #cam.on { display: flex; }
+  #camVideo { flex: 1; min-height: 0; width: 100%; object-fit: cover; background: #000; }
+  #camMsg { position: absolute; top: 40%; left: 0; right: 0; padding: 0 24px; text-align: center; color: #fff; font-size: 1rem; line-height: 1.6; }
+  #camBar { display: flex; align-items: center; justify-content: space-between; padding: 16px 24px calc(16px + env(safe-area-inset-bottom)); background: #0f172a; }
+  #camBar > * { flex: 1; }
+  #camCancel { background: none; border: 0; color: #e2e8f0; font-size: 1.05rem; text-align: left; padding: 12px 0; }
+  #camShot { flex: 0 0 72px; width: 72px; height: 72px; border-radius: 50%; border: 5px solid #fff; background: #2563eb; margin: 0 auto; }
+  #camShot:active { transform: scale(.94); }
+  #camShot:disabled { opacity: .4; }
+  #camRetry { display: none; margin: 18px auto 0; padding: 16px 28px; border: 0; border-radius: 14px; background: #2563eb; color: #fff; font-size: 1.1rem; font-weight: 700; }
+  #camRetry.on { display: block; }
+  #camVer { position: absolute; top: 8px; right: 10px; color: #64748b; font-size: .7rem; }
+  #dbg { display: none; position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; max-height: 38%; overflow: auto; margin: 0; padding: 8px 10px; background: rgba(0,0,0,.88); color: #86efac; font: 11px/1.45 monospace; white-space: pre-wrap; word-break: break-word; }
+  #dbg.on { display: block; }
+  #camDiag { margin-top: 14px; color: #94a3b8; font-size: .75rem; word-break: break-word; }
+</style>
+</head>
+<body>
+
+<!-- Sale Hub (Apps Script) : ระบบเช็คอินที่ฝังอยู่ข้างในจะขอให้หน้านี้เปิดกล้องแทน -->
+<iframe id="app" title="Sale Hub" allow="geolocation; clipboard-write"></iframe>
+
+<!-- กล้อง: เปิดจากหน้านี้ เพราะ Google ไม่ให้สิทธิ์กล้องกับหน้า Apps Script -->
+<div id="cam" role="dialog" aria-label="ถ่ายรูป">
+  <video id="camVideo" autoplay playsinline muted></video>
+  <div id="camMsg"><div id="camText"></div><button type="button" id="camRetry">📷 แตะที่นี่เพื่อเปิดกล้อง</button><div id="camDiag"></div></div>
+  <div id="camVer">hub v1</div>
+  <div id="camBar">
+    <button type="button" id="camCancel">ยกเลิก</button>
+    <button type="button" id="camShot" aria-label="ถ่ายรูป"></button>
+    <span></span>
+  </div>
+</div>
+
+<!-- โหมดตรวจสอบ: เปิดลิงก์แบบต่อท้าย ?debug=1 จะมี log ขึ้นด้านล่างจอ -->
+<pre id="dbg"></pre>
+
+<script>
+(function () {
+  'use strict';
+
+  var DEBUG = /[?&]debug=1/.test(location.search);
+  var dbgEl = document.getElementById('dbg');
+  var t0 = Date.now();
+  function log() {
+    if (!DEBUG) return;
+    var a = [].slice.call(arguments).map(function (x) {
+      try { return typeof x === 'string' ? x : JSON.stringify(x); } catch (_) { return String(x); }
+    });
+    dbgEl.textContent += ((Date.now() - t0) / 1000).toFixed(1) + 's  ' + a.join(' ') + String.fromCharCode(10);
+    dbgEl.scrollTop = dbgEl.scrollHeight;
+  }
+  if (DEBUG) {
+    dbgEl.classList.add('on');
+    log('hub v1', navigator.userAgent);
+    log('mediaDevices:', !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia), '| secure:', window.isSecureContext);
+    window.addEventListener('error', function (e) { log('JS ERROR:', e.message, e.lineno); });
+    window.addEventListener('unhandledrejection', function (e) { log('REJECT:', String(e.reason)); });
+    if (navigator.permissions && navigator.permissions.query) {
+      navigator.permissions.query({ name: 'camera' }).then(function (p) { log('camera permission:', p.state); }, function (e) { log('perm query fail:', String(e)); });
+    }
+  }
+
+  // ลิงก์ /exec ของ Sale Hub
+  var APP_URL = 'https://script.google.com/macros/s/AKfycbwhiRFTUOaqGgm3HTL7a_FDeMYn8NxFPvk9jcapYwdmBgqDQT9Bc4RTGGlKa4EJJlTULg/exec';
+  var MAX_SIDE = 1280;   // ย่อรูปด้านยาวไม่เกิน 1280px
+  var QUALITY = 0.72;
+
+  var frame = document.getElementById('app');
+  var cam = document.getElementById('cam');
+  var video = document.getElementById('camVideo');
+  var msg = document.getElementById('camText');
+  var retryBtn = document.getElementById('camRetry');
+  var diag = document.getElementById('camDiag');
+  var shotBtn = document.getElementById('camShot');
+  var stream = null;
+  var req = null;        // คำขอถ่ายรูปที่ค้างอยู่ { id, source, origin }
+  var tries = 0, retryTimer = null;
+
+  frame.src = APP_URL;
+  frame.addEventListener('load', function () { log('iframe loaded'); });
+
+  // รับเฉพาะข้อความจากหน้า Apps Script (โค้ดผู้ใช้รันที่ *.googleusercontent.com)
+  function fromApp(origin) {
+    return /^https:\/\/[a-z0-9-]+\.googleusercontent\.com$/i.test(origin);
+  }
+  function reply(to, data) {
+    try { to.source.postMessage(data, to.origin); } catch (_) {}
+  }
+
+  function stopCam() {
+    clearTimeout(retryTimer); retryTimer = null;
+    if (stream) stream.getTracks().forEach(function (t) { t.stop(); });
+    stream = null;
+    video.srcObject = null;
+    cam.classList.remove('on');
+    msg.textContent = '';
+    diag.textContent = '';
+    retryBtn.classList.remove('on');
+  }
+  function finish(data) {
+    var r = req;
+    req = null;
+    stopCam();
+    log('finish ->', data.type, data.message || '', data.data ? '(photo ' + data.data.length + ' chars)' : '');
+    if (r) { data.id = r.id; reply(r, data); }
+  }
+
+  function errText(e) {
+    var n = e && e.name;
+    if (n === 'NotAllowedError' || n === 'SecurityError') {
+      return 'ยังไม่ได้อนุญาตกล้อง — กด "อนุญาต" เมื่อมีหน้าต่างถาม หรือเปิดสิทธิ์กล้องของเว็บนี้/แอปที่ใช้เปิดลิงก์ แล้วกดเปิดกล้องอีกครั้ง';
+    }
+    if (n === 'NotReadableError' || n === 'AbortError') return 'กล้องถูกใช้งานโดยแอปอื่นอยู่ — ปิดแอปกล้อง/วิดีโอคอลแล้วลองอีกครั้ง';
+    if (n === 'NotFoundError') return 'ไม่พบกล้องในเครื่องนี้';
+    return 'เปิดกล้องไม่ได้ (' + (n || 'ไม่ทราบสาเหตุ') + ') — ลองอีกครั้ง';
+  }
+
+  function openCam(isRetry) {
+    if (isRetry !== true) tries = 0;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      return finish({ type: 'pdc-cam-error', message: 'เบราว์เซอร์นี้เปิดกล้องไม่ได้' });
+    }
+    cam.classList.add('on');
+    shotBtn.disabled = true;
+    retryBtn.classList.remove('on');
+    if (isRetry !== true) msg.textContent = 'กำลังเปิดกล้อง… ถ้ามีหน้าต่างถาม ให้กด "อนุญาต"';
+    var gum = function (c) { log('getUserMedia', c); return navigator.mediaDevices.getUserMedia({ video: c }); };
+    gum({ facingMode: { ideal: 'environment' } })
+      .catch(function (e) {
+        if (e && (e.name === 'NotAllowedError' || e.name === 'SecurityError')) throw e;
+        return gum(true);
+      })
+      .then(function (s) {
+        if (!req) { s.getTracks().forEach(function (t) { t.stop(); }); return; } // ยกเลิกไปก่อนกล้องพร้อม
+        stream = s;
+        log('camera OK');
+        video.srcObject = s;
+        msg.textContent = '';
+        shotBtn.disabled = false;
+        var p = video.play && video.play();
+        if (p && p.catch) p.catch(function () {});
+      })
+      .catch(function (e) {
+        if (!req) return;
+        // ไม่ปิดหน้ากล้อง: แสดงสาเหตุ + ปุ่มให้แตะเปิดกล้องเอง (บางแอปยอมเปิดกล้องเฉพาะเมื่อผู้ใช้แตะในหน้านี้โดยตรง)
+        var denied = e && (e.name === 'NotAllowedError' || e.name === 'SecurityError');
+        tries++;
+        log('camera FAIL:', e && e.name, e && e.message, '| hidden:', document.hidden);
+        msg.textContent = denied
+          ? 'ยังเปิดกล้องไม่ได้ — ถ้ามีหน้าต่างถาม ให้กด "อนุญาต" แล้วแตะปุ่มด้านล่าง'
+          : errText(e);
+        diag.textContent = '[' + (e && e.name || '?') + ': ' + (e && e.message || '') + ' | try=' + tries + ']';
+        retryBtn.classList.add('on');
+        // ลองเองอีก 1 ครั้ง เผื่อผู้ใช้เพิ่งกดอนุญาต
+        if (denied && tries === 1) retryTimer = setTimeout(function () { if (req && !stream) openCam(true); }, 1500);
+      });
+  }
+
+  retryBtn.addEventListener('click', function () {
+    clearTimeout(retryTimer); retryTimer = null;
+    if (req && !stream) { msg.textContent = 'กำลังเปิดกล้อง…'; openCam(true); }
+  });
+
+  shotBtn.addEventListener('click', function () {
+    var w = video.videoWidth, h = video.videoHeight;
+    if (!w || !h) { msg.textContent = 'กล้องยังไม่พร้อม รอสักครู่'; return; }
+    var scale = Math.min(1, MAX_SIDE / Math.max(w, h));
+    var c = document.createElement('canvas');
+    c.width = Math.round(w * scale);
+    c.height = Math.round(h * scale);
+    c.getContext('2d').drawImage(video, 0, 0, c.width, c.height);
+    finish({ type: 'pdc-cam-photo', data: c.toDataURL('image/jpeg', QUALITY) });
+  });
+  document.getElementById('camCancel').addEventListener('click', function () {
+    finish({ type: 'pdc-cam-cancel' });
+  });
+
+  window.addEventListener('message', function (e) {
+    var d = e.data;
+    if (d && typeof d === 'object' && typeof d.type === 'string' && d.type.indexOf('pdc-cam-') === 0) log('msg', d.type, 'from', e.origin, fromApp(e.origin) ? '' : '(REJECTED origin)');
+    if (!d || typeof d !== 'object' || !fromApp(e.origin)) return;
+    if (d.type === 'pdc-cam-ping') {
+      reply({ source: e.source, origin: e.origin }, { type: 'pdc-cam-pong' });
+    } else if (d.type === 'pdc-cam-open') {
+      if (req) finish({ type: 'pdc-cam-cancel' });
+      req = { id: d.id, source: e.source, origin: e.origin };
+      openCam();
+    } else if (d.type === 'pdc-cam-close') {
+      if (req) finish({ type: 'pdc-cam-cancel' });
+    }
+  });
+
+  // ปิดกล้องเมื่อพับจอ/สลับแอป
+  document.addEventListener('visibilitychange', function () {
+    log('visibility hidden=', document.hidden);
+    if (document.hidden && req && stream) finish({ type: 'pdc-cam-cancel' });
+  });
+})();
+</script>
+</body>
+</html>
